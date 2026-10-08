@@ -235,7 +235,10 @@ class MlxHfConfig(BaseModel):
     hf_hub_cache: str = "huggingface/hub"
     mlx_bookmarks: list[MlxBookmark] = Field(default_factory=list)
     # Generation / KV (mirrors ``utilities.environment.Environment`` MLX_* keys)
-    mlx_max_tokens: int = 512
+    # Per-turn generation cap.  512 truncates tool-call JSON mid-stream
+    # (see ChatMLXText truncation recovery).  Match the Settings UI / oMLX
+    # default so a distilled student can finish a tool turn.
+    mlx_max_tokens: int = 8192
     mlx_temp: float = 0.0
     mlx_verbose: bool = False
     mlx_thinking: bool = False
@@ -281,6 +284,12 @@ class MlxHfConfig(BaseModel):
     # Paged-cache block size (tokens per block).  Default aligned with the
     # omlx engine's recommended value.
     turbo_block_size: int = 256
+
+    # Optional LoRA adapter directory or Hub path, applied at load time via
+    # ``mlx_lm.load(..., adapter_path=)``.  Empty disables adapters.  An
+    # adapter is only loaded when ``adapter_meta.json`` (if present) names
+    # this same ``hf_llm_model_id`` as ``base_repo_id``.
+    adapter_path: str = ""
 
 
 class HookDefinition(BaseModel):
@@ -415,6 +424,15 @@ class OrchestratorConfig(BaseModel):
     # run ends gracefully with a partial result.  0 disables either threshold.
     tool_call_soft_budget: int = 80
     tool_call_hard_budget: int = 150
+
+    # Max subagents (``task`` calls) the orchestrator runs at once.  Local
+    # inference servers (oMLX / exo / MLX) hold one long-context KV cache per
+    # concurrent subagent, so a wide fan-out can exhaust memory and trigger
+    # "Prefill context too large for available memory".
+    #   -1 (default) — auto: 2 on local providers, unlimited on hosted APIs.
+    #    0           — always unlimited.
+    #    N > 0       — run at most N subagents concurrently; the rest queue.
+    max_parallel_subagents: int = -1
 
 
 class MCPAuthConfig(BaseModel):
@@ -1270,6 +1288,22 @@ class SetupState(BaseModel):
     completed_steps: list[str] = Field(default_factory=list)
 
 
+class DistillationConfig(BaseModel):
+    """On-device model distillation (LoRA on a user-chosen student).
+
+    The live adapter loaded at inference is ``MlxHfConfig.adapter_path``,
+    not a field here.  These fields choose the teacher/student pair and
+    control Path A collection.
+    """
+
+    enabled: bool = False
+    data_dir: str = ""  # empty ⇒ <app_data>/distillation/
+    min_tool_calls: int = 2
+    teacher_model_id: str = "mlx-community/Qwen3-32B-4bit"
+    student_model_id: str = "mlx-community/Qwen3-8B-4bit"
+    filter_sessions_by_teacher: bool = False
+
+
 class AppConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
@@ -1304,6 +1338,7 @@ class AppConfig(BaseModel):
     # sessions, and macOS activity.  See AmbientConfig for all controls.
     ambient: AmbientConfig = Field(default_factory=AmbientConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
+    distillation: DistillationConfig = Field(default_factory=DistillationConfig)
 
     @model_validator(mode="after")
     def _fix_memory_llm_family(self) -> "AppConfig":
@@ -1749,6 +1784,7 @@ class AppConfig(BaseModel):
                 "MLX_TURBO_SSD_MAX_GB": str(m.turbo_ssd_max_gb),
                 "MLX_TURBO_TQ_BITS": str(m.turbo_tq_bits),
                 "MLX_TURBO_BLOCK_SIZE": str(m.turbo_block_size),
+                "MLX_ADAPTER_PATH": m.adapter_path or "",
             }
 
         anthropic_keys = tuple(_anthropic_block().keys())
@@ -1891,6 +1927,11 @@ class AppConfig(BaseModel):
         # Per-run tool-call budget (soft nudge + hard graceful stop).
         env["TOOL_CALL_SOFT_BUDGET"] = str(max(0, orch.tool_call_soft_budget))
         env["TOOL_CALL_HARD_BUDGET"] = str(max(0, orch.tool_call_hard_budget))
+
+        # Subagent fan-out cap (-1 = auto, 0 = unlimited, N = cap).
+        env["MAX_PARALLEL_SUBAGENTS"] = (
+            "auto" if orch.max_parallel_subagents < 0 else str(orch.max_parallel_subagents)
+        )
 
         for srv in self.mcp_servers:
             if srv.id == "playwright-mcp" and srv.url:

@@ -16,7 +16,6 @@ Usage::
     )
 """
 
-import asyncio
 import json
 import logging
 from typing import Any, List, Optional, Sequence, Union
@@ -52,6 +51,7 @@ from chat_models.mlx._shared import (
     _LOADED_MODELS,
     _WARMED_UP,
     _load_or_reuse,
+    cache_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -236,6 +236,9 @@ class ChatMLXText(BaseChatModel):
     # legacy unbounded behaviour.  Default 65 536 tokens ≈ 2 GB on a 7B
     # 4-bit model, above OTTO's ~35k-token prompt.
     prompt_cache_max_tokens: int = 65536
+    # Optional LoRA adapter.  Empty/None loads the bare student.  Must match
+    # ``adapter_meta.json`` ``base_repo_id`` when that sidecar exists.
+    adapter_path: Optional[str] = None
 
     # Exposes the effective input budget to framework helpers such as
     # ``compute_summarization_defaults`` (deepagents) and
@@ -271,10 +274,10 @@ class ChatMLXText(BaseChatModel):
         # exceeds most local model context windows and never fires.
         if not self.profile:
             self.profile = {"max_input_tokens": self.prompt_cache_max_tokens}
-        cache_key = (self.model_path, self.draft_model_path)
+        cache_key_t = cache_key(self.model_path, self.draft_model_path, self.adapter_path)
         logger.info(
             "Initialising ChatMLXText: %s (max_tokens=%d, temp=%.2f, kv_bits=%s, "
-            "prompt_cache=%s, system_prompt_cache=%s, thinking=%s)",
+            "prompt_cache=%s, system_prompt_cache=%s, thinking=%s, adapter=%s)",
             self.model_path,
             self.max_tokens,
             self.temp,
@@ -282,8 +285,9 @@ class ChatMLXText(BaseChatModel):
             self.enable_prompt_cache,
             self.enable_system_prompt_cache,
             self.thinking,
+            self.adapter_path or "-",
         )
-        if cache_key in _LOADED_MODELS:
+        if cache_key_t in _LOADED_MODELS:
             logger.info(
                 "MLX model %s reused from process cache (no reload)",
                 self.model_path,
@@ -292,10 +296,12 @@ class ChatMLXText(BaseChatModel):
             logger.info("Loading MLX model: %s", self.model_path)
             if self.draft_model_path:
                 logger.info("Loading MLX draft model: %s", self.draft_model_path)
+            if self.adapter_path:
+                logger.info("Loading MLX LoRA adapter: %s", self.adapter_path)
 
         try:
             triple, freshly_loaded = _load_or_reuse(
-                self.model_path, self.draft_model_path,
+                self.model_path, self.draft_model_path, self.adapter_path,
             )
         except Exception as exc:  # noqa: BLE001
             # A memory error while pulling weights into unified Metal memory
@@ -356,9 +362,9 @@ class ChatMLXText(BaseChatModel):
                 self.model_path,
             )
 
-        if cache_key not in _WARMED_UP:
+        if cache_key_t not in _WARMED_UP:
             self._warmup()
-            _WARMED_UP.add(cache_key)
+            _WARMED_UP.add(cache_key_t)
 
     # ── Warmup ────────────────────────────────────────────────────────────────
 
@@ -848,6 +854,9 @@ class ChatMLXText(BaseChatModel):
         if native_mode:
             active_stop_tokens = stop_tokens_for(self._tool_family) or _STOP_TOKENS
 
+        # Set by ``_agenerate`` when its awaiting task is cancelled (Stop).
+        cancel_event = kwargs.pop("cancel_event", None)
+
         # Hold the process-wide MLX generation lock for the entire stream.
         # Releasing between tokens would let another thread sneak in a
         # ``stream_generate`` call and trigger the Metal command-buffer
@@ -861,6 +870,14 @@ class ChatMLXText(BaseChatModel):
             ):
                 text += response.text
                 last_response = response
+                # Nobody will read the rest: stop now rather than decode on to
+                # max_tokens while every other MLX request waits for the lock.
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info(
+                        "MLX generation cancelled after %d tokens — stopping decode.",
+                        response.generation_tokens,
+                    )
+                    break
                 if not native_mode and _action_block_complete(text):
                     break
                 # Some mlx_lm / tokenizer combinations don't honour every stop
@@ -979,8 +996,14 @@ class ChatMLXText(BaseChatModel):
         run_manager=None,
         **kwargs,
     ) -> ChatResult:
-        """Run generation in a thread pool to avoid blocking the event loop."""
-        return await asyncio.to_thread(
+        """Run generation in a thread pool to avoid blocking the event loop.
+
+        Cancelling this coroutine also stops the worker thread's decode — see
+        :func:`chat_models.mlx._shared.to_thread_cancellable`.
+        """
+        from chat_models.mlx._shared import to_thread_cancellable
+
+        return await to_thread_cancellable(
             self._generate, messages, stop=stop, **kwargs
         )
 
