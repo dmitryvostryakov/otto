@@ -234,6 +234,135 @@ def test_model_fingerprint_follows_the_weight_files(tmp_path):
     assert _prefix_disk.model_fingerprint("test/not-a-cached-repo") is None
 
 
+def _tiny_model_dir(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors").write_bytes(b"w" * 10)
+    return model
+
+
+def _adapter_dir(root, name, payload=b"a" * 8):
+    adapter = root / name
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text('{"rank": 8}')
+    (adapter / "adapters.safetensors").write_bytes(payload)
+    return adapter
+
+
+def test_a_lora_adapter_gets_snapshots_of_its_own(tmp_path):
+    # The adapter changes the weights every cached token was computed with: a
+    # snapshot of the base model, or of another adapter, must never be loaded.
+    model = _tiny_model_dir(tmp_path)
+    base = _prefix_disk.model_fingerprint(str(model))
+    one = _adapter_dir(tmp_path, "one")
+    other = _adapter_dir(tmp_path, "other", payload=b"b" * 8)
+    with_one = _prefix_disk.model_fingerprint(str(model), str(one))
+    with_other = _prefix_disk.model_fingerprint(str(model), str(other))
+    assert None not in (base, with_one, with_other)
+    assert len({base, with_one, with_other}) == 3
+    # Stable for the same files, and the same through the weights file itself.
+    assert with_one == _prefix_disk.model_fingerprint(str(model), str(one))
+    through_file = _prefix_disk.model_fingerprint(str(model), str(one / "adapters.safetensors"))
+    assert through_file not in (None, base)
+    # No adapter is no adapter: empty and ``None`` mean the bare model.
+    assert _prefix_disk.model_fingerprint(str(model), None) == base
+    assert _prefix_disk.model_fingerprint(str(model), "") == base
+
+
+def test_a_retrained_adapter_at_the_same_path_gets_new_snapshots(tmp_path):
+    model = _tiny_model_dir(tmp_path)
+    adapter = _adapter_dir(tmp_path, "adapter")
+    first = _prefix_disk.model_fingerprint(str(model), str(adapter))
+    (adapter / "adapters.safetensors").write_bytes(b"retrained!")
+    resized = _prefix_disk.model_fingerprint(str(model), str(adapter))
+    os.utime(adapter / "adapters.safetensors", (1_000_000, 1_000_000))
+    touched = _prefix_disk.model_fingerprint(str(model), str(adapter))
+    (adapter / "adapter_config.json").write_text('{"rank": 16}')
+    reconfigured = _prefix_disk.model_fingerprint(str(model), str(adapter))
+    assert len({first, resized, touched, reconfigured}) == 4
+
+
+def test_an_adapter_that_cant_be_read_gives_no_fingerprint(tmp_path):
+    # Nothing may be shared across restarts for weights we can't identify.
+    model = _tiny_model_dir(tmp_path)
+    empty = tmp_path / "empty-adapter"
+    empty.mkdir()
+    assert _prefix_disk.model_fingerprint(str(model), str(empty)) is None
+    assert _prefix_disk.model_fingerprint(str(model), str(tmp_path / "missing")) is None
+
+
+def test_a_session_with_a_lora_never_shares_snapshot_files_with_the_base_model(monkeypatch, tmp_path):
+    # Through the real loader: base model, adapter one and adapter two are
+    # three different sets of weights, so no SSD file may be common to them —
+    # yet a restart with the same adapter must find its own files again.
+    model_dir = _tiny_model_dir(tmp_path)
+    one = _adapter_dir(tmp_path, "one")
+    two = _adapter_dir(tmp_path, "two", payload=b"b" * 8)
+    adapters_loaded = []
+
+    def fake_load(path, adapter_path=None):
+        adapters_loaded.append(adapter_path)
+        return _TinyLM(HYBRID), TokenizerWrapper(_QwenLikeTokenizer())
+
+    monkeypatch.setattr(mlx_lm, "load", fake_load)
+    monkeypatch.setattr(chat_mlx_text, "_WARMED_UP", set())
+    monkeypatch.setattr(ChatMLXText, "_warmup", lambda self: None)
+    monkeypatch.setattr(chat_mlx_text, "weights_fingerprint", _shared.weights_fingerprint)
+
+    def fresh_process():
+        monkeypatch.setattr(_shared, "_LOADED_MODELS", {})
+        monkeypatch.setattr(_shared, "_WEIGHTS_FINGERPRINTS", {})
+
+    def session(adapter=None):
+        return ChatMLXText(
+            model_path=str(model_dir), adapter_path=adapter, enable_prompt_cache=True,
+            enable_system_prompt_cache=True, kv_bits=4,
+        )
+
+    tokens = list(range(1, 50))
+    fresh_process()
+    keys = {
+        "base": session()._ssd_key(tokens),
+        "one": session(str(one))._ssd_key(tokens),
+        "two": session(str(two))._ssd_key(tokens),
+    }
+    assert adapters_loaded == [None, str(one), str(two)]  # three real loads
+    assert None not in keys.values()
+    assert len(set(keys.values())) == 3
+
+    fresh_process()
+    assert session(str(one))._ssd_key(tokens) == keys["one"]
+    assert session()._ssd_key(tokens) == keys["base"]
+
+
+def test_a_snapshot_written_for_the_base_model_is_not_loaded_into_a_lora_session(monkeypatch, tmp_path, disk):
+    # The same prompt, the same KV settings: only the weights differ.
+    model_dir = _tiny_model_dir(tmp_path)
+    adapter = _adapter_dir(tmp_path, "adapter")
+    monkeypatch.setattr(mlx_lm, "load", lambda path, adapter_path=None: (
+        _TinyLM(HYBRID), TokenizerWrapper(_QwenLikeTokenizer()),
+    ))
+    monkeypatch.setattr(_shared, "_LOADED_MODELS", {})
+    monkeypatch.setattr(_shared, "_WEIGHTS_FINGERPRINTS", {})
+    monkeypatch.setattr(chat_mlx_text, "_WARMED_UP", set())
+    monkeypatch.setattr(ChatMLXText, "_warmup", lambda self: None)
+    monkeypatch.setattr(chat_mlx_text, "weights_fingerprint", _shared.weights_fingerprint)
+    tokens = list(range(1, 50))
+
+    def session(adapter_path=None):
+        return ChatMLXText(
+            model_path=str(model_dir), adapter_path=adapter_path, enable_prompt_cache=True,
+            enable_system_prompt_cache=True, kv_bits=4,
+        )
+
+    base, lora = session(), session(str(adapter))
+    layers = _hybrid_snapshot()
+    assert disk.save(base._ssd_key(tokens), layers, _TOKENS)
+    assert disk.load(base._ssd_key(tokens), _TOKENS, len(layers)) is not None
+    assert disk.load(lora._ssd_key(tokens), _TOKENS, len(layers)) is None
+
+
 def test_snapshots_are_keyed_by_the_weights_that_were_loaded(monkeypatch, tmp_path):
     # A catalog re-download replaces the files while the old weights stay
     # loaded: what new sessions prefill with them isn't the new weights' state.

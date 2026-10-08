@@ -316,7 +316,10 @@ def _load_or_reuse(
 
         from chat_models.mlx._prefix_disk import model_fingerprint
 
-        fingerprint = model_fingerprint(resolved_path)
+        # The LoRA is part of what the weights are: a snapshot computed with
+        # one adapter must never be restored into the base model or another
+        # adapter, so it is fingerprinted with them.
+        fingerprint = model_fingerprint(resolved_path, resolved_adapter)
         load_kwargs: dict[str, Any] = {}
         if resolved_adapter:
             load_kwargs["adapter_path"] = resolved_adapter

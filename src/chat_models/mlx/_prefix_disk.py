@@ -66,7 +66,21 @@ def cache_dir_from_env() -> Optional[Path]:
     return Path(value).expanduser() if value.strip() else None
 
 
-def model_fingerprint(local_dir: str) -> Optional[str]:
+def _adapter_files(adapter_path: str) -> List[Path]:
+    """The LoRA files *adapter_path* (a directory, or one weights file) loads from."""
+    adapter = Path(adapter_path).expanduser().resolve()
+    if adapter.is_file():
+        folder, files = adapter.parent, [adapter]
+    else:
+        folder = adapter
+        files = [p for p in adapter.iterdir() if p.suffix in _WEIGHT_SUFFIXES]
+    config = folder / "adapter_config.json"
+    if config.is_file():
+        files.append(config)
+    return sorted(files)
+
+
+def model_fingerprint(local_dir: str, adapter_path: Optional[str] = None) -> Optional[str]:
     """Identify the model files in *local_dir*, or ``None`` when it holds no weights.
 
     Taken when the model is loaded from there (see
@@ -74,6 +88,11 @@ def model_fingerprint(local_dir: str) -> Optional[str]:
     re-download — while those weights stay loaded.  Without a fingerprint
     nothing may be shared across restarts: another model could later load
     under the same name.
+
+    A LoRA adapter changes the weights every cached token was computed with,
+    so *adapter_path* is part of the fingerprint: the base model and each
+    adapter (or a retrained one at the same path) get snapshots of their own.
+    An adapter whose files can't be read gives no fingerprint at all.
     """
     try:
         local = Path(local_dir).resolve()
@@ -84,6 +103,14 @@ def model_fingerprint(local_dir: str) -> Optional[str]:
         for path in files:
             stat = path.stat()
             digest.update(f"|{path.name}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+        if adapter_path:
+            adapter_files = _adapter_files(adapter_path)
+            if not any(p.suffix in _WEIGHT_SUFFIXES for p in adapter_files):
+                return None
+            digest.update(b"|lora")
+            for path in adapter_files:
+                stat = path.stat()
+                digest.update(f"|{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode())
     except OSError:  # not a local model directory
         return None
     return digest.hexdigest()
