@@ -233,9 +233,9 @@ class ChatMLXText(BaseChatModel):
     # over, the generated tail is dropped (the cache rolls back to the
     # reusable prompt prefix), or the cache is rebuilt when that prefix
     # alone exceeds the cap.  ``0`` disables the cap and reverts to the
-    # legacy unbounded behaviour.  Default 32 768 tokens ≈ 1 GB on a 7B
-    # 4-bit model.
-    prompt_cache_max_tokens: int = 32768
+    # legacy unbounded behaviour.  Default 65 536 tokens ≈ 2 GB on a 7B
+    # 4-bit model, above OTTO's ~35k-token prompt.
+    prompt_cache_max_tokens: int = 65536
 
     # Exposes the effective input budget to framework helpers such as
     # ``compute_summarization_defaults`` (deepagents) and

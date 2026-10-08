@@ -33,7 +33,7 @@ class Environment:
     # Soft cap on the KV prefix cache, in tokens (0 = unbounded).  Primary
     # defence against unbounded memory growth in long autonomous sessions —
     # see ``MlxHfConfig.mlx_prompt_cache_max_tokens`` for the full rationale.
-    MLX_PROMPT_CACHE_MAX_TOKENS = "32768"
+    MLX_PROMPT_CACHE_MAX_TOKENS = "65536"
     # Temperature the ToolLoopGuard requests for the recovery turn(s) after it
     # detects an identical-call loop.  Greedy decoding (temp 0) is a common
     # cause of such loops, so a one-shot bump lets the model break out.  0 =
@@ -291,15 +291,16 @@ class Environment:
         """Soft cap on the KV prefix cache size, measured in tokens.
 
         After each generation, ``ChatMLXText`` checks the cumulative cache
-        offset; when it exceeds this value the cache is trimmed (or fully
-        rebuilt for non-trimmable layer types) so long autonomous sessions
-        don't OOM the host.  ``0`` disables the cap (legacy unbounded
-        behaviour).  Default ``32768`` ≈ 1 GB on a 7B 4-bit model.
+        offset; when it exceeds this value the generated tail is dropped, or
+        the cache is rebuilt when the reusable prompt itself doesn't fit, so
+        long autonomous sessions don't OOM the host.  ``0`` disables the cap
+        (legacy unbounded behaviour).  Default ``65536`` ≈ 2 GB on a 7B
+        4-bit model, above OTTO's ~35k-token prompt.
         """
         try:
             return max(0, int(os.getenv("MLX_PROMPT_CACHE_MAX_TOKENS", cls.MLX_PROMPT_CACHE_MAX_TOKENS)))
         except ValueError:
-            return 32768
+            return 65536
 
     # ── Turbo mode (oMLX-derived optimisations) ──────────────────────────
 

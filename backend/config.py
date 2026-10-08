@@ -247,13 +247,15 @@ class MlxHfConfig(BaseModel):
     mlx_num_draft_tokens: int = 3  # tokens proposed per speculative step; tune to model pair
     # Soft cap on the KV prefix cache, in tokens.  After each generation the
     # chat model checks the cumulative cache offset; if it exceeds this value,
-    # the cache is trimmed down to ~half so the next turn doesn't immediately
-    # trip the cap again.  This is the primary defence against unbounded
-    # memory growth in long autonomous sessions — a 7B 4-bit model uses
-    # roughly 32 KB of cache per token, so the default 32 768 tokens caps the
-    # KV pool at ~1 GB (smaller for sub-7B / lower-precision models).  Set
-    # to 0 to disable the cap (legacy unbounded behaviour).
-    mlx_prompt_cache_max_tokens: int = 32768
+    # the generated tail is dropped and the reusable prompt prefix is kept.
+    # If that prefix itself exceeds the cap, the cache is rebuilt.  This is
+    # the primary defence against unbounded memory growth in long autonomous
+    # sessions — a 7B 4-bit model uses roughly 32 KB of cache per token, so
+    # the default 65 536 tokens caps the KV pool at ~2 GB (smaller for sub-7B
+    # / lower-precision models).  It has to sit above OTTO's ~35k-token
+    # prompt or prefix reuse never happens.  Set to 0 to disable the cap
+    # (legacy unbounded behaviour).
+    mlx_prompt_cache_max_tokens: int = 65536
 
     # ── Turbo mode (oMLX-derived optimisations) ──────────────────────────
     #
