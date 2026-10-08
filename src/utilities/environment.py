@@ -9,6 +9,27 @@ from utilities.logger import get_logger
 logger = get_logger()
 
 
+def _resolve_distill_pair(model_id: str | None, adapter_path: str | None) -> tuple[str, str]:
+    """Map ``otto-distill/…`` catalog ids to ``(student_hub_id, adapter_dir)``.
+
+    Non-catalog ids pass through.  Import of the distillation package is
+    lazy so Environment stays importable in tests that don't load backend.
+    """
+    model = model_id or ""
+    adapter = (adapter_path or "").strip()
+    if not model.strip().startswith("otto-distill/"):
+        return model, adapter
+    try:
+        from backend.distillation.catalog import resolve_catalog_id
+
+        rec = resolve_catalog_id(model.strip())
+    except Exception:
+        return model, adapter
+    if not rec:
+        return model, adapter
+    return str(rec.get("base_repo_id") or model), str(rec.get("adapter_path") or adapter)
+
+
 class Environment:
     """Environment configuration management."""
 
@@ -33,7 +54,7 @@ class Environment:
     # Soft cap on the KV prefix cache, in tokens (0 = unbounded).  Primary
     # defence against unbounded memory growth in long autonomous sessions —
     # see ``MlxHfConfig.mlx_prompt_cache_max_tokens`` for the full rationale.
-    MLX_PROMPT_CACHE_MAX_TOKENS = "32768"
+    MLX_PROMPT_CACHE_MAX_TOKENS = "65536"
     # Temperature the ToolLoopGuard requests for the recovery turn(s) after it
     # detects an identical-call loop.  Greedy decoding (temp 0) is a common
     # cause of such loops, so a one-shot bump lets the model break out.  0 =
@@ -73,6 +94,8 @@ class Environment:
     MLX_TURBO_SSD_MAX_GB = "50"
     MLX_TURBO_TQ_BITS = "4"
     MLX_TURBO_BLOCK_SIZE = "256"
+    # Optional LoRA adapter path for mlx_lm.load(..., adapter_path=).
+    MLX_ADAPTER_PATH = ""
     # HuggingFace repo ID — MLX models are loaded from HuggingFace Hub (mlx-community)
     HF_LLM_MODEL_ID = "mlx-community/quantized-gemma-2b-it"
     HF_VLM_MODEL_ID = ""
@@ -120,6 +143,13 @@ class Environment:
     # either threshold.
     TOOL_CALL_SOFT_BUDGET = "80"
     TOOL_CALL_HARD_BUDGET = "150"
+
+    # Max ``task`` (subagent) calls the orchestrator runs concurrently.
+    # ``auto`` → 2 on local inference providers (mlx / exo / omlx), where each
+    # subagent is another long-context request on the same machine, and
+    # unlimited on hosted APIs.  ``0`` = always unlimited; ``N`` = cap at N.
+    MAX_PARALLEL_SUBAGENTS = "auto"
+    MAX_PARALLEL_SUBAGENTS_LOCAL_DEFAULT = 2
 
     # exo distributed-inference cluster (OpenAI-compatible local API)
     EXO_BASE_URL = "http://127.0.0.1:52415"
@@ -291,15 +321,16 @@ class Environment:
         """Soft cap on the KV prefix cache size, measured in tokens.
 
         After each generation, ``ChatMLXText`` checks the cumulative cache
-        offset; when it exceeds this value the cache is trimmed (or fully
-        rebuilt for non-trimmable layer types) so long autonomous sessions
-        don't OOM the host.  ``0`` disables the cap (legacy unbounded
-        behaviour).  Default ``32768`` ≈ 1 GB on a 7B 4-bit model.
+        offset; when it exceeds this value the generated tail is dropped, or
+        the cache is rebuilt when the reusable prompt itself doesn't fit, so
+        long autonomous sessions don't OOM the host.  ``0`` disables the cap
+        (legacy unbounded behaviour).  Default ``65536`` ≈ 2 GB on a 7B
+        4-bit model, above OTTO's ~35k-token prompt.
         """
         try:
             return max(0, int(os.getenv("MLX_PROMPT_CACHE_MAX_TOKENS", cls.MLX_PROMPT_CACHE_MAX_TOKENS)))
         except ValueError:
-            return 32768
+            return 65536
 
     # ── Turbo mode (oMLX-derived optimisations) ──────────────────────────
 
@@ -363,8 +394,18 @@ class Environment:
 
     @classmethod
     def get_hf_llm_model_id(cls) -> str:
-        """Get HuggingFace repo ID for MLX model (models load from HuggingFace Hub)."""
-        return os.getenv("HF_LLM_MODEL_ID", cls.HF_LLM_MODEL_ID)
+        """Get HuggingFace repo ID for MLX model (models load from HuggingFace Hub).
+
+        Distilled catalog ids (``otto-distill/…``) resolve to the student
+        Hub repo the LoRA was trained on.
+        """
+        raw = os.getenv("HF_LLM_MODEL_ID", cls.HF_LLM_MODEL_ID)
+        if not (raw or "").strip().startswith("otto-distill/"):
+            return raw
+        model, _adapter = _resolve_distill_pair(
+            raw, os.getenv("MLX_ADAPTER_PATH", cls.MLX_ADAPTER_PATH),
+        )
+        return model
 
     @classmethod
     def get_hf_vlm_model_id(cls) -> str | None:
@@ -386,6 +427,23 @@ class Environment:
         """
         val = os.getenv("HF_DRAFT_LLM_MODEL_ID", cls.HF_DRAFT_LLM_MODEL_ID).strip()
         return val or None
+
+    @classmethod
+    def get_mlx_adapter_path(cls) -> str | None:
+        """Optional LoRA adapter directory/path for the MLX text model.
+
+        Empty / unset returns ``None`` (no adapter).  The inference path
+        still refuses to apply an adapter whose ``adapter_meta.json``
+        ``base_repo_id`` does not match the live model.
+
+        When the selected model is an ``otto-distill/…`` catalog id, the
+        matching adapter directory is returned even if ``MLX_ADAPTER_PATH``
+        is empty.
+        """
+        model = os.getenv("HF_LLM_MODEL_ID", cls.HF_LLM_MODEL_ID)
+        adapter = os.getenv("MLX_ADAPTER_PATH", cls.MLX_ADAPTER_PATH)
+        _base, path = _resolve_distill_pair(model, adapter)
+        return path or None
 
     @classmethod
     def get_anthropic_api_key(cls) -> str:
@@ -742,6 +800,27 @@ class Environment:
             return max(0, int(os.getenv("TOOL_CALL_HARD_BUDGET", cls.TOOL_CALL_HARD_BUDGET)))
         except (ValueError, TypeError):
             return int(cls.TOOL_CALL_HARD_BUDGET)
+
+    @classmethod
+    def get_max_parallel_subagents(cls) -> int:
+        """Max concurrent subagent (``task``) executions; ``0`` = unlimited.
+
+        Configured via ``MAX_PARALLEL_SUBAGENTS``.  ``auto`` (default) caps at
+        :attr:`MAX_PARALLEL_SUBAGENTS_LOCAL_DEFAULT` when the orchestrator
+        runs on a local provider (mlx / exo / omlx) and is unlimited
+        otherwise.  Unparseable or negative values fall back to ``auto``."""
+        raw = os.getenv("MAX_PARALLEL_SUBAGENTS", cls.MAX_PARALLEL_SUBAGENTS).strip().lower()
+        if raw not in ("", "auto"):
+            try:
+                n = int(raw)
+                if n >= 0:
+                    return n
+            except (TypeError, ValueError):
+                pass
+        provider = cls.get_deep_agent_llm_provider() or cls.get_llm_provider()
+        if provider in ("mlx", "exo", "omlx"):
+            return cls.MAX_PARALLEL_SUBAGENTS_LOCAL_DEFAULT
+        return 0
 
     @classmethod
     def get_computer_voyager_max_messages(cls) -> int:

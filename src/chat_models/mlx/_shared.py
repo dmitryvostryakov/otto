@@ -6,10 +6,11 @@ This module centralises the globals that both the existing
 
 * :data:`MLX_GEN_LOCK` — serialises every Metal ``stream_generate`` call to
   avoid the ``command encoder is already encoding`` assertion.
-* :data:`_LOADED_MODELS` — cache of ``(model_path, draft_path) -> (model,
-  tokenizer, draft_model)`` triples so additional ``ChatMLXText`` instances
-  (and, later, ``TurboMLXChat``) re-use already-loaded weights instead of
-  re-pulling them into unified memory.
+* :data:`_LOADED_MODELS` — cache of
+  ``(model_path, draft_path, adapter_path) -> (model, tokenizer, draft_model)``
+  triples so additional ``ChatMLXText`` instances re-use already-loaded
+  weights.  ``adapter_path`` is part of the key so a LoRA cannot leak
+  onto a later bare-model load.
 * :data:`_WARMED_UP` — set of cache keys that have already paid the graph
   compilation cost (see ``ChatMLXText._warmup``).
 * :func:`_load_or_reuse` — thread-safe factory for the triple.
@@ -25,9 +26,15 @@ backward-compatibility with modules that do
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import threading
 import weakref
-from typing import Any, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 # ── Shared model registry ─────────────────────────────────────────────────────
@@ -40,8 +47,9 @@ from typing import Any, List, Optional, Tuple
 # budget on machines running more than one session.
 
 _ModelTriple = Tuple[Any, Any, Optional[Any]]
-_LOADED_MODELS: dict[Tuple[str, Optional[str]], _ModelTriple] = {}
-_WARMED_UP: set[Tuple[str, Optional[str]]] = set()
+_CacheKey = Tuple[str, Optional[str], Optional[str]]
+_LOADED_MODELS: dict[_CacheKey, _ModelTriple] = {}
+_WARMED_UP: set[_CacheKey] = set()
 _LOAD_LOCK = threading.Lock()
 # id(model) → (weak reference to the model, fingerprint of the files it was
 # loaded from); see ``weights_fingerprint``.
@@ -73,6 +81,36 @@ _WEIGHTS_FINGERPRINTS: dict[int, Tuple[Any, Optional[str]]] = {}
 # same process.
 
 MLX_GEN_LOCK = threading.Lock()
+
+
+# ── Cancellable generation ────────────────────────────────────────────────────
+#
+# Async callers run the blocking ``_generate`` in a worker thread.  Cancelling
+# the awaiting task (the session Stop button) only cancels the *await*: a
+# thread cannot be interrupted, so left alone it would decode on to
+# ``max_tokens`` while holding ``MLX_GEN_LOCK``, with every other MLX request
+# queued behind output nobody reads.  Cancellation is therefore cooperative —
+# the thread gets a per-call event and checks it after every token.
+
+
+async def to_thread_cancellable(
+    generate: Callable[..., Any], /, *args: Any, **kwargs: Any,
+) -> Any:
+    """Await ``generate(*args, cancel_event=<event>, **kwargs)`` in a worker thread.
+
+    *generate* must stop decoding once ``cancel_event`` is set; the event is
+    set as soon as the await ends, so a cancelled caller (which still gets
+    :class:`asyncio.CancelledError`) no longer leaves a decode running.
+    """
+    cancel_event = threading.Event()
+    try:
+        return await asyncio.to_thread(
+            generate, *args, cancel_event=cancel_event, **kwargs
+        )
+    finally:
+        # No-op when the thread already returned; otherwise the await was
+        # interrupted and the still-running decode must stop.
+        cancel_event.set()
 
 
 # ── Loop-recovery temperature bump ────────────────────────────────────────────
@@ -182,17 +220,76 @@ def _resolve_local_path(model_path: str) -> str:
     return local
 
 
+def cache_key(
+    model_path: str,
+    draft_model_path: Optional[str] = None,
+    adapter_path: Optional[str] = None,
+) -> _CacheKey:
+    """Stable ``_LOADED_MODELS`` key.  Empty adapter/draft collapse to None."""
+    draft = draft_model_path or None
+    adapter = adapter_path or None
+    return (model_path, draft, adapter)
+
+
+def _adapter_base_repo(adapter_path: str) -> Optional[str]:
+    """Read ``adapter_meta.json`` ``base_repo_id`` if present."""
+    p = Path(adapter_path)
+    meta = (p.parent if p.is_file() else p) / "adapter_meta.json"
+    if not meta.is_file():
+        return None
+    try:
+        data = json.loads(meta.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    base = str(data.get("base_repo_id") or "").strip()
+    return base or None
+
+
+def effective_adapter_path(
+    model_path: str,
+    adapter_path: Optional[str],
+) -> Optional[str]:
+    """Return *adapter_path* only when it is compatible with *model_path*.
+
+    Missing metadata is allowed (third-party LoRAs).  A mismatched
+    ``base_repo_id`` is dropped with a warning so an 8B adapter cannot
+    silently attach to a 14B live model.
+    """
+    if not adapter_path:
+        return None
+    base = _adapter_base_repo(adapter_path)
+    if base and base != model_path:
+        logger.warning(
+            "Skipping LoRA adapter %s: trained on %s, live model is %s",
+            adapter_path, base, model_path,
+        )
+        return None
+    return adapter_path
+
+
 def _load_or_reuse(
     model_path: str,
     draft_model_path: Optional[str],
+    adapter_path: Optional[str] = None,
 ) -> Tuple[_ModelTriple, bool]:
     """Return cached ``(model, tokenizer, draft_model)`` or load on miss.
 
     Returns ``(triple, freshly_loaded)`` so the caller can gate one-time
     side effects (logging, warmup) on the first load.  Thread-safe under
     the initial-load race via double-checked locking.
+
+    ``adapter_path`` is part of the cache key.  Applying a LoRA to a
+    cached bare model would mutate the shared weights and leak into the
+    next session.
     """
-    key = (model_path, draft_model_path)
+    adapter_path = effective_adapter_path(model_path, adapter_path)
+    # Speculative decoding + a LoRA on the main model (but not the draft)
+    # collapses draft acceptance; refuse the draft when an adapter is on.
+    if adapter_path:
+        draft_model_path = None
+    key = cache_key(model_path, draft_model_path, adapter_path)
     cached = _LOADED_MODELS.get(key)
     if cached is not None:
         return cached, False
@@ -210,13 +307,24 @@ def _load_or_reuse(
         resolved_draft_path = (
             _resolve_local_path(draft_model_path) if draft_model_path else None
         )
+        resolved_adapter = None
+        if adapter_path:
+            adapter_p = Path(adapter_path).expanduser()
+            resolved_adapter = str(adapter_p) if adapter_p.exists() else adapter_path
 
         from mlx_lm import load  # lazy import — only required on Apple Silicon
 
         from chat_models.mlx._prefix_disk import model_fingerprint
 
         fingerprint = model_fingerprint(resolved_path)
-        model, tokenizer = load(resolved_path)
+        load_kwargs: dict[str, Any] = {}
+        if resolved_adapter:
+            load_kwargs["adapter_path"] = resolved_adapter
+            logger.info(
+                "Loading MLX model %s with LoRA adapter %s",
+                model_path, resolved_adapter,
+            )
+        model, tokenizer = load(resolved_path, **load_kwargs)
         _WEIGHTS_FINGERPRINTS[id(model)] = (weakref.ref(model), fingerprint)
         draft_model: Optional[Any] = None
         if resolved_draft_path:
@@ -244,11 +352,8 @@ def weights_fingerprint(model: Any) -> Optional[str]:
     return entry[1] if entry is not None and entry[0]() is model else None
 
 
-def loaded_mlx_models() -> List[Tuple[str, Optional[str]]]:
-    """Return the list of currently cached ``(model_path, draft_path)`` keys.
-
-    Exposed for diagnostics / settings UI.  Not part of the hot path.
-    """
+def loaded_mlx_models() -> List[_CacheKey]:
+    """Return currently cached ``(model_path, draft_path, adapter_path)`` keys."""
     return list(_LOADED_MODELS.keys())
 
 
