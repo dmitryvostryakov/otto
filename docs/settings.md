@@ -126,7 +126,7 @@ In-process local inference via [MLX](https://github.com/ml-explore/mlx) on Apple
 | Repetition penalty | Default 1.1 |
 | KV cache bits | `Full precision`, `4-bit KV`, or `8-bit KV` |
 | KV group size | Quantisation group size (32 / 64 / 128) |
-| KV cache cap (tokens) | Caps how large the attention cache grows; default 32,768 (≈1 GB on a 7B 4-bit model). `0` = unbounded |
+| KV cache cap (tokens) | Caps how large the attention cache grows; default 65,536 (≈2 GB on a 7B 4-bit model). `0` = unbounded |
 | Verbose MLX logging | Logs Thought/Action/Observation traces |
 | Chain-of-thought thinking | Enable thinking tokens (Qwen-style models) |
 | KV prompt cache across turns | Reuse the KV cache between turns for faster responses |

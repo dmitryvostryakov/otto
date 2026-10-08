@@ -63,7 +63,7 @@ def build_turbo_chat(
     kv_bits: Any = None,
     kv_group_size: int = 64,
     repetition_penalty: float = 1.1,
-    prompt_cache_max_tokens: int = 32768,
+    prompt_cache_max_tokens: int = 65536,
     turbo_ssd_dir: str = "",
     turbo_ssd_max_gb: int = 50,
 ) -> TurboMLXChat:

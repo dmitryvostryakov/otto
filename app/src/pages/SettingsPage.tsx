@@ -254,7 +254,7 @@ const DEFAULT_SETTINGS: AppSettings = {
       mlx_kv_bits: null,
       mlx_kv_group_size: 64,
       mlx_repetition_penalty: 1.1,
-      mlx_prompt_cache_max_tokens: 32768,
+      mlx_prompt_cache_max_tokens: 65536,
       turbo_level: "off",
       turbo_ssd_dir: "",
       turbo_ssd_max_gb: 50,
@@ -2394,12 +2394,12 @@ export default function SettingsPage() {
                     <InputField
                       label="KV cache cap (tokens, 0 = unbounded)"
                       type="number"
-                      value={String(settings.llm.mlx.mlx_prompt_cache_max_tokens ?? 32768)}
+                      value={String(settings.llm.mlx.mlx_prompt_cache_max_tokens ?? 65536)}
                       onChange={(v) => updateMlxPartial({ mlx_prompt_cache_max_tokens: Math.max(0, parseInt(v, 10) || 0) })}
                     />
                   </div>
                   <p className="text-[11px] text-th-text-muted leading-relaxed">
-                    The KV cache stores the model's attention state for the conversation so far. Without a cap it grows for as long as the agent runs and can push your Mac into swap or trigger out-of-memory crashes after long autonomous sessions. The default 32 768 tokens caps the cache around 1 GB on a 7B 4-bit model. When the cap is hit, the cache trims back to roughly half before the next turn (one slower turn, then back to normal). Set to 0 only if you know you have headroom.
+                    The KV cache stores the model's attention state for the conversation so far. Without a cap it grows for as long as the agent runs and can push your Mac into swap or trigger out-of-memory crashes after long autonomous sessions. The default 65 536 tokens caps the cache around 2 GB on a 7B 4-bit model, above OTTO's prompt so the cache can be reused. When the cap is hit, the generated tail is dropped and the reusable prompt is kept; if the prompt itself is larger than the cap, the cache is rebuilt. Set to 0 only if you know you have headroom.
                   </p>
                   <div className="flex flex-col gap-3">
                     <Toggle label="Verbose MLX logging (Thought/Action/Observation)" checked={settings.llm.mlx.mlx_verbose} onChange={(v) => updateMlxPartial({ mlx_verbose: v })} />

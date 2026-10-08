@@ -813,10 +813,11 @@ export interface MlxHfConfig {
   mlx_repetition_penalty: number;
   /**
    * Soft cap on the KV prefix cache, in tokens.  When the cumulative cache
-   * offset exceeds this value after a generation, the cache is trimmed (or
-   * fully rebuilt for non-trimmable layer types) so long autonomous sessions
-   * don't OOM the host.  ``0`` disables the cap (legacy unbounded
-   * behaviour).  Default 32 768 tokens ≈ 1 GB on a 7B 4-bit model.
+   * offset exceeds this value after a generation, the generated tail is
+   * dropped, or the cache is rebuilt when the reusable prompt itself doesn't
+   * fit, so long autonomous sessions don't OOM the host.  ``0`` disables the
+   * cap (legacy unbounded behaviour).  Default 65 536 tokens ≈ 2 GB on a 7B
+   * 4-bit model, above OTTO's ~35k-token prompt.
    */
   mlx_prompt_cache_max_tokens: number;
   /**
